@@ -15,7 +15,6 @@ from io import StringIO
 from typing import Dict, List, Set, Tuple
 
 import networkx as nx
-import numpy as np
 import pandas as pd
 
 from models import (
@@ -74,7 +73,10 @@ class FraudDetector:
     # Scoring
     CYCLE_SCORE = 50
     PASSTHROUGH_SCORE = 30
+    AMOUNT_ANOMALY_SCORE = 20
     TEMPORAL_SCORE = 20
+    ROUND_AMOUNT_SCORE = 15
+    DORMANCY_SCORE = 15
     FAN_IO_SCORE = 10
     MAX_SCORE = 100
     SUSPICIOUS_THRESHOLD = 60
@@ -87,6 +89,12 @@ class FraudDetector:
     MERCHANT_PT_CAP = 0.5
     TEMPORAL_WINDOW_H = 72
     TEMPORAL_TX_MIN = 10
+    ROUND_AMOUNTS = {1000, 2000, 5000, 10000, 20000, 25000, 50000, 100000}
+    ROUND_RATIO_THRESHOLD = 0.5    # ≥50% of txns are round → flag
+    ANOMALY_SIGMA = 3.0            # 3 standard deviations
+    DORMANCY_ACTIVE_H = 48         # burst window
+    DORMANCY_SILENT_H = 168        # 7 days silence after burst
+    DORMANCY_MIN_TXN = 5           # min txns in burst
 
     # Performance limits
     MAX_CYCLES = 500
@@ -112,6 +120,9 @@ class FraudDetector:
         self.passthrough: Set[str] = set()
         self.temporal: Set[str] = set()
         self.merchants: Set[str] = set()
+        self.round_amount: Set[str] = set()
+        self.dormancy: Set[str] = set()
+        self.anomaly: Set[str] = set()
 
         self.scores: Dict[str, int] = {}
         self.patterns: Dict[str, List[str]] = {}
@@ -146,7 +157,7 @@ class FraudDetector:
 
         # Auto-generate transaction_id if absent
         if "transaction_id" not in self.df.columns:
-            self.df["transaction_id"] = np.arange(1, len(self.df) + 1).astype(str)
+            self.df["transaction_id"] = [str(i) for i in range(1, len(self.df) + 1)]
 
         # Vectorized type conversion
         self.df["sender_id"] = self.df["sender_id"].astype(str).str.strip()
@@ -242,8 +253,11 @@ class FraudDetector:
         self._detect_fan()
         self._detect_chains()
         self._detect_passthrough()
+        self._detect_round_amounts()
+        self._detect_amount_anomaly()
         if self.has_ts:
             self._detect_temporal()
+            self._detect_rapid_dormancy()
         self._detect_merchants()
 
     def _detect_cycles(self) -> None:
@@ -361,6 +375,88 @@ class FraudDetector:
 
             self.merchants.add(node)
 
+    # ── Round Amount Detection ─────────────────────────────────
+
+    def _detect_round_amounts(self) -> None:
+        """Flag accounts where ≥50% of transactions are suspicious round numbers."""
+        self.round_amount = set()
+        for acct in self.graph.nodes():
+            txns = self.df[
+                (self.df["sender_id"] == acct) | (self.df["receiver_id"] == acct)
+            ]
+            if len(txns) == 0:
+                continue
+            round_count = sum(
+                1 for amt in txns["amount"]
+                if amt > 0 and (amt in self.ROUND_AMOUNTS or amt % 1000 == 0)
+            )
+            if round_count / len(txns) >= self.ROUND_RATIO_THRESHOLD:
+                self.round_amount.add(acct)
+
+    # ── Amount Anomaly (Statistical) ───────────────────────────
+
+    def _detect_amount_anomaly(self) -> None:
+        """Flag accounts with transactions >3σ from global mean."""
+        self.anomaly = set()
+        amounts = self.df["amount"]
+        if len(amounts) < 5:
+            return
+        mean = amounts.mean()
+        std = amounts.std()
+        if std == 0:
+            return
+        threshold = mean + self.ANOMALY_SIGMA * std
+
+        # Find transactions above threshold
+        outliers = self.df[self.df["amount"] > threshold]
+        self.anomaly.update(outliers["sender_id"].unique())
+        self.anomaly.update(outliers["receiver_id"].unique())
+
+    # ── Rapid Dormancy Detection ───────────────────────────────
+
+    def _detect_rapid_dormancy(self) -> None:
+        """Flag accounts that go silent after a burst of activity."""
+        self.dormancy = set()
+        if not self.has_ts:
+            return
+
+        active_window = timedelta(hours=self.DORMANCY_ACTIVE_H)
+        silent_window = timedelta(hours=self.DORMANCY_SILENT_H)
+
+        # Group timestamps per account
+        sender_ts = self.df.groupby("sender_id")["timestamp"].apply(list).to_dict()
+        receiver_ts = self.df.groupby("receiver_id")["timestamp"].apply(list).to_dict()
+        all_accts = set(sender_ts.keys()) | set(receiver_ts.keys())
+
+        # Global max timestamp (latest tx in dataset)
+        global_max = self.df["timestamp"].max()
+
+        for acct in all_accts:
+            ts = sorted(sender_ts.get(acct, []) + receiver_ts.get(acct, []))
+            if len(ts) < self.DORMANCY_MIN_TXN:
+                continue
+
+            # Check if there's a burst followed by silence
+            for i in range(len(ts) - self.DORMANCY_MIN_TXN + 1):
+                burst_end = i + self.DORMANCY_MIN_TXN - 1
+                # Is the burst within the active window?
+                if ts[burst_end] - ts[i] <= active_window:
+                    # Check for silence after the burst
+                    last_burst_ts = ts[burst_end]
+                    # Are there any txns after the burst?
+                    later_txns = [t for t in ts[burst_end + 1:] if t > last_burst_ts]
+                    if not later_txns:
+                        # No activity after burst — check if enough time passed
+                        if global_max - last_burst_ts >= silent_window:
+                            self.dormancy.add(acct)
+                            break
+                    else:
+                        # Next txn is far away
+                        gap = later_txns[0] - last_burst_ts
+                        if gap >= silent_window:
+                            self.dormancy.add(acct)
+                            break
+
     # ══════════════════════════════════════════════════════════════
     # SCORING
     # ══════════════════════════════════════════════════════════════
@@ -397,9 +493,21 @@ class FraudDetector:
                 s += self.PASSTHROUGH_SCORE
                 p.append("passthrough_shell")
 
+            if node in self.anomaly:
+                s += self.AMOUNT_ANOMALY_SCORE
+                p.append("amount_anomaly")
+
             if node in self.temporal:
                 s += self.TEMPORAL_SCORE
                 p.append("temporal_clustering")
+
+            if node in self.round_amount:
+                s += self.ROUND_AMOUNT_SCORE
+                p.append("round_amount_structuring")
+
+            if node in self.dormancy:
+                s += self.DORMANCY_SCORE
+                p.append("rapid_dormancy")
 
             if node in self.fan_in:
                 s += self.FAN_IO_SCORE

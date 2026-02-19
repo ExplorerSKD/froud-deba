@@ -6,11 +6,12 @@
  * - Fraud ring members = larger red nodes with glow
  * - Click node → shows account details
  * - Hover node → highlights connections
+ * - Exposes cy instance via onCyReady callback
  */
 import { useEffect, useRef, useState } from 'react';
 import cytoscape from 'cytoscape';
 
-export default function GraphVisualization({ graphData, suspiciousAccounts }) {
+export default function GraphVisualization({ graphData, suspiciousAccounts, onCyReady }) {
     const containerRef = useRef(null);
     const cyRef = useRef(null);
     const [selectedNode, setSelectedNode] = useState(null);
@@ -18,7 +19,7 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
     useEffect(() => {
         if (!graphData || !containerRef.current) return;
 
-        // Destroy previous instance cleanly if it exists
+        // Destroy previous instance cleanly
         if (cyRef.current) {
             cyRef.current.destroy();
             cyRef.current = null;
@@ -27,10 +28,8 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
         let destroyed = false;
         let layout = null;
 
-        // Build Cytoscape elements
+        // Build elements
         const elements = [];
-
-        // Nodes
         graphData.nodes.forEach((node) => {
             elements.push({
                 data: {
@@ -43,8 +42,6 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
                 },
             });
         });
-
-        // Edges
         graphData.edges.forEach((edge, idx) => {
             elements.push({
                 data: {
@@ -58,7 +55,6 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
             });
         });
 
-        // Initialize Cytoscape
         const cy = cytoscape({
             container: containerRef.current,
             elements,
@@ -77,7 +73,7 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
                         height: 30,
                         'border-width': 2,
                         'border-color': '#818cf8',
-                        'transition-property': 'background-color, width, height, border-color',
+                        'transition-property': 'background-color, width, height, border-color, opacity',
                         'transition-duration': '0.2s',
                     },
                 },
@@ -112,7 +108,7 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
                         'target-arrow-shape': 'triangle',
                         'curve-style': 'bezier',
                         'arrow-scale': 1.2,
-                        'transition-property': 'line-color, target-arrow-color, width',
+                        'transition-property': 'line-color, target-arrow-color, width, opacity',
                         'transition-duration': '0.2s',
                     },
                 },
@@ -135,18 +131,30 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
                 },
                 {
                     selector: '.dimmed',
+                    style: { opacity: 0.2 },
+                },
+                {
+                    selector: '.search-highlight',
                     style: {
-                        opacity: 0.2,
+                        'background-color': '#22d3ee',
+                        'border-color': '#67e8f9',
+                        'border-width': 4,
+                        width: 50,
+                        height: 50,
+                        'z-index': 999,
                     },
                 },
+                {
+                    selector: '.search-dimmed',
+                    style: { opacity: 0.15 },
+                },
             ],
-            // Layout runs separately so we can stop it on cleanup
             layout: { name: 'preset' },
             minZoom: 0.3,
             maxZoom: 3,
         });
 
-        // Run layout separately so we can track and stop it
+        // Run layout
         layout = cy.layout({
             name: 'cose',
             animate: true,
@@ -157,7 +165,7 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
         });
         layout.run();
 
-        // Click node → show details (guarded)
+        // Click node
         cy.on('tap', 'node', (e) => {
             if (destroyed) return;
             const node = e.target;
@@ -173,13 +181,13 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
             });
         });
 
-        // Click background → deselect (guarded)
+        // Click background
         cy.on('tap', (e) => {
             if (destroyed) return;
             if (e.target === cy) setSelectedNode(null);
         });
 
-        // Hover → highlight connections (guarded)
+        // Hover
         cy.on('mouseover', 'node', (e) => {
             if (destroyed) return;
             const node = e.target;
@@ -189,7 +197,6 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
             node.connectedEdges().addClass('highlighted-edge');
             neighborhood.nodes().not(node).addClass('highlighted');
         });
-
         cy.on('mouseout', 'node', () => {
             if (destroyed) return;
             cy.elements().removeClass('dimmed highlighted highlighted-edge');
@@ -197,15 +204,16 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
 
         cyRef.current = cy;
 
-        // Cleanup: stop layout first, then destroy
+        // Notify parent that cy is ready
+        if (onCyReady) onCyReady(cy);
+
         return () => {
             destroyed = true;
-            if (layout) {
-                layout.stop();
-            }
+            if (layout) layout.stop();
             cy.removeAllListeners();
             cy.destroy();
             cyRef.current = null;
+            if (onCyReady) onCyReady(null);
         };
     }, [graphData, suspiciousAccounts]);
 
@@ -233,7 +241,6 @@ export default function GraphVisualization({ graphData, suspiciousAccounts }) {
 
             <div ref={containerRef} className="cytoscape-container" />
 
-            {/* Node detail panel */}
             {selectedNode && (
                 <div className="mt-4 p-4 rounded-xl bg-indigo-500/10 border border-indigo-500/30">
                     <h3 className="font-bold text-indigo-300 mb-2">
